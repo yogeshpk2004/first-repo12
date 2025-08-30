@@ -1,0 +1,364 @@
+"""
+🧵 Mahalaxmi Garments & Textiles - CLI Store
+Features:
+- View catalog (categories) + search
+- Add/remove items to cart (with quantity)
+- Auto stock check & deduction
+- Discounts: bulk + coupon codes
+- GST calculation (configurable)
+- Invoice generation & save to /invoices
+"""
+
+import os
+import datetime
+from textwrap import dedent
+
+# ---------------- Configuration ----------------
+STORE_NAME = "Mahalaxmi Garments & Textiles"
+GST_RATE = 0.05  # 5% GST; change if you need different rate
+BULK_DISCOUNT_MIN = 2000     # ₹
+BULK_DISCOUNT_RATE = 0.10    # 10%
+
+# Coupon codes: CODE: (discount_rate, min_cart_total)
+COUPONS = {
+    "NEW10": (0.10, 0),       # 10% no minimum
+    "FEST20": (0.20, 3000),   # 20% with ₹3000+ cart
+    "SAVE50": (50, 1000),     # flat ₹50 off on ₹1000+ (if value <=1 it's treated as rate? We'll treat >=1 as flat)
+}
+
+# ---------------- Sample Catalog ----------------
+# sku must be unique. Stock is per SKU (size/color baked into variant).
+CATALOG = [
+    {"sku": "TSHIRT-M-RED", "name": "Cotton T-Shirt (Red)", "category": "Menswear", "price": 499, "stock": 20},
+    {"sku": "TSHIRT-L-BLK", "name": "Cotton T-Shirt (Black)", "category": "Menswear", "price": 549, "stock": 15},
+    {"sku": "SHIRT-40-WHT", "name": "Formal Shirt (White, 40)", "category": "Menswear", "price": 999, "stock": 10},
+    {"sku": "KURTI-M-BLU", "name": "Printed Kurti (Blue)", "category": "Ladieswear", "price": 899, "stock": 12},
+    {"sku": "SAREE-SILK-1", "name": "Silk Saree (Maroon)", "category": "Ladieswear", "price": 2499, "stock": 5},
+    {"sku": "JEANS-30-IND", "name": "Denim Jeans (30)", "category": "Unisex", "price": 1299, "stock": 18},
+    {"sku": "KIDS-SET-5Y", "name": "Kids Co-ord Set (5Y)", "category": "Kids", "price": 799, "stock": 9},
+    {"sku": "TOWEL-XL-WHT", "name": "Bath Towel XL (White)", "category": "Textiles", "price": 399, "stock": 30},
+    {"sku": "BED-DS-COT", "name": "Cotton Bedsheet (Double)", "category": "Textiles", "price": 1099, "stock": 8},
+    {"sku": "SOCKS-3P-BLK", "name": "Socks 3-Pack (Black)", "category": "Accessories", "price": 199, "stock": 25},
+]
+
+# ---------------- Store Classes ----------------
+class Store:
+    def __init__(self, name, catalog):
+        self.name = name
+        self.catalog = {item["sku"]: item.copy() for item in catalog}
+
+    def list_categories(self):
+        return sorted(set(item["category"] for item in self.catalog.values()))
+
+    def list_by_category(self, category):
+        return [i for i in self.catalog.values() if i["category"].lower() == category.lower()]
+
+    def search(self, term):
+        term = term.lower()
+        return [i for i in self.catalog.values()
+                if term in i["name"].lower() or term in i["sku"].lower() or term in i["category"].lower()]
+
+    def get(self, sku):
+        return self.catalog.get(sku)
+
+    def reduce_stock(self, sku, qty):
+        if sku in self.catalog:
+            self.catalog[sku]["stock"] -= qty
+
+class Cart:
+    def __init__(self):
+        self.items = {}   # sku -> {"name","price","qty"}
+        self.coupon = None
+
+    def add(self, product, qty):
+        if product["sku"] not in self.items:
+            self.items[product["sku"]] = {"name": product["name"], "price": product["price"], "qty": 0}
+        self.items[product["sku"]]["qty"] += qty
+
+    def remove(self, sku, qty=None):
+        if sku not in self.items:
+            return
+        if qty is None or qty >= self.items[sku]["qty"]:
+            del self.items[sku]
+        else:
+            self.items[sku]["qty"] -= qty
+
+    def clear(self):
+        self.items.clear()
+        self.coupon = None
+
+    def subtotal(self):
+        return sum(v["price"] * v["qty"] for v in self.items.values())
+
+    def set_coupon(self, code):
+        self.coupon = code.upper()
+
+    def compute_discounts(self):
+        sub = self.subtotal()
+
+        # Bulk discount
+        bulk = 0
+        if sub >= BULK_DISCOUNT_MIN:
+            bulk = sub * BULK_DISCOUNT_RATE
+
+        # Coupon discount
+        coupon_disc = 0
+        coupon_applied = None
+        if self.coupon and self.coupon in COUPONS:
+            rule = COUPONS[self.coupon]
+            min_needed = rule[1]
+            if sub >= min_needed:
+                # Support percent or flat: if first value <1 -> percent, else flat rupees
+                if rule[0] < 1:
+                    coupon_disc = sub * rule[0]
+                else:
+                    coupon_disc = rule[0]
+                coupon_applied = self.coupon
+
+        total_disc = bulk + coupon_disc
+        return bulk, coupon_disc, coupon_applied, total_disc
+
+    def totals(self):
+        sub = self.subtotal()
+        bulk, coupon_disc, coupon_code, total_disc = self.compute_discounts()
+        after_disc = max(sub - total_disc, 0)
+        gst = after_disc * GST_RATE
+        grand = after_disc + gst
+        return {
+            "subtotal": sub,
+            "bulk_discount": bulk,
+            "coupon_discount": coupon_disc,
+            "coupon_code": coupon_code,
+            "total_discount": total_disc,
+            "after_discount": after_disc,
+            "gst": gst,
+            "grand_total": grand
+        }
+
+# ---------------- Helpers ----------------
+def money(n):  # ₹ formatting without external libs
+    return f"₹{n:,.2f}"
+
+def print_table(rows, headers):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, col in enumerate(r):
+            widths[i] = max(widths[i], len(str(col)))
+    line = "+".join("-" * (w + 2) for w in widths)
+    fmt = " | ".join("{:<" + str(w) + "}" for w in widths)
+    print(line)
+    print(fmt.format(*headers))
+    print(line)
+    for r in rows:
+        print(fmt.format(*r))
+    print(line)
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def generate_invoice_text(store, cart: Cart, txn_id, buyer=None, phone=None, address=None):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    t = cart.totals()
+
+    lines = []
+    lines.append(f"{store.name}".center(60))
+    lines.append("GST Invoice".center(60))
+    lines.append("-" * 60)
+    lines.append(f"Txn ID: {txn_id}")
+    lines.append(f"Date  : {now}")
+    if buyer:
+        lines.append(f"Customer : {buyer}")
+    if phone:
+        lines.append(f"Phone    : {phone}")
+    if address:
+        lines.append(f"Address  : {address}")
+    lines.append("-" * 60)
+    lines.append(f"{'SKU':<16} {'Item':<26} {'Qty':>3} {'Price':>6} {'Total':>8}")
+    lines.append("-" * 60)
+    for sku, v in cart.items.items():
+        total = v["price"] * v["qty"]
+        lines.append(f"{sku:<16} {v['name'][:26]:<26} {v['qty']:>3} {v['price']:>6} {total:>8}")
+    lines.append("-" * 60)
+    lines.append(f"Subtotal           : {money(t['subtotal'])}")
+    if t["bulk_discount"] > 0:
+        lines.append(f"Bulk Discount      : -{money(t['bulk_discount'])}")
+    if t["coupon_discount"] > 0:
+        code = t['coupon_code'] or ''
+        lines.append(f"Coupon {code:<10}: -{money(t['coupon_discount'])}")
+    lines.append(f"Total Discount     : -{money(t['total_discount'])}")
+    lines.append(f"After Discount     : {money(t['after_discount'])}")
+    lines.append(f"GST @ {int(GST_RATE*100)}%       : {money(t['gst'])}")
+    lines.append(f"Grand Total        : {money(t['grand_total'])}")
+    lines.append("-" * 60)
+    lines.append("Thank you for shopping with us!")
+    return "\n".join(lines)
+
+def save_invoice(text):
+    ensure_dir("invoices")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"invoices/invoice_{ts}.txt"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(text)
+    return fname
+
+# ---------------- CLI ----------------
+def show_menu():
+    print(dedent("""
+    ========== MAIN MENU ==========
+    1. View categories
+    2. View items by category
+    3. Search item
+    4. View cart
+    5. Add item to cart
+    6. Remove item from cart
+    7. Apply coupon
+    8. Checkout & Generate Invoice
+    9. Clear cart
+    0. Exit
+    """))
+
+def view_categories(store):
+    cats = store.list_categories()
+    print_table([[c] for c in cats], ["Categories"])
+
+def view_by_category(store):
+    category = input("Enter category name: ").strip()
+    items = store.list_by_category(category)
+    if not items:
+        print("No items found for that category.")
+        return
+    rows = [[i["sku"], i["name"], i["price"], i["stock"]] for i in items]
+    print_table(rows, ["SKU", "Item", "Price", "Stock"])
+
+def search_items(store):
+    term = input("Search term (name/sku/category): ").strip()
+    items = store.search(term)
+    if not items:
+        print("No matching items.")
+        return
+    rows = [[i["sku"], i["name"], i["category"], i["price"], i["stock"]] for i in items]
+    print_table(rows, ["SKU", "Item", "Category", "Price", "Stock"])
+
+def show_cart(cart: Cart):
+    if not cart.items:
+        print("Cart is empty.")
+        return
+    rows = []
+    for sku, v in cart.items.items():
+        rows.append([sku, v["name"], v["qty"], v["price"], v["price"] * v["qty"]])
+    print_table(rows, ["SKU", "Item", "Qty", "Price", "Total"])
+    t = cart.totals()
+    print(f"Subtotal        : {money(t['subtotal'])}")
+    if t["bulk_discount"] > 0:
+        print(f"Bulk Discount   : -{money(t['bulk_discount'])}")
+    if t["coupon_discount"] > 0:
+        print(f"Coupon Discount : -{money(t['coupon_discount'])} (Code: {t['coupon_code']})")
+    print(f"After Discount  : {money(t['after_discount'])}")
+    print(f"GST @ {int(GST_RATE*100)}%  : {money(t['gst'])}")
+    print(f"Grand Total     : {money(t['grand_total'])}")
+
+def add_to_cart(store, cart: Cart):
+    sku = input("Enter SKU to add: ").strip().upper()
+    product = store.get(sku)
+    if not product:
+        print("Invalid SKU.")
+        return
+    print(f"{product['name']} | Price: {money(product['price'])} | Stock: {product['stock']}")
+    try:
+        qty = int(input("Quantity: "))
+    except ValueError:
+        print("Invalid quantity.")
+        return
+    if qty <= 0:
+        print("Quantity must be positive.")
+        return
+    if qty > product["stock"]:
+        print(f"Only {product['stock']} left in stock.")
+        return
+    cart.add(product, qty)
+    print(f"Added {qty} x {product['name']} to cart.")
+
+def remove_from_cart(cart: Cart):
+    sku = input("Enter SKU to remove: ").strip().upper()
+    if sku not in cart.items:
+        print("SKU not in cart.")
+        return
+    try:
+        qty_str = input("Quantity to remove (empty for all): ").strip()
+        qty = int(qty_str) if qty_str else None
+    except ValueError:
+        print("Invalid quantity.")
+        return
+    cart.remove(sku, qty)
+    print("Item updated/removed.")
+
+def apply_coupon(cart: Cart):
+    code = input("Enter coupon code (NEW10 / FEST20 / SAVE50): ").strip().upper()
+    if code not in COUPONS:
+        print("Invalid coupon.")
+        return
+    cart.set_coupon(code)
+    print(f"Coupon {code} applied (subject to minimum cart value).")
+
+def checkout(store, cart: Cart):
+    if not cart.items:
+        print("Cart is empty.")
+        return
+    # Confirm stock & deduct
+    for sku, v in cart.items.items():
+        prod = store.get(sku)
+        if not prod or prod["stock"] < v["qty"]:
+            print(f"Insufficient stock for {sku}.")
+            return
+
+    buyer = input("Buyer name (optional): ").strip() or None
+    phone = input("Phone (optional): ").strip() or None
+    address = input("Address (optional): ").strip() or None
+
+    # Deduct stock
+    for sku, v in cart.items.items():
+        store.reduce_stock(sku, v["qty"])
+
+    txn_id = "TXN" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    invoice_text = generate_invoice_text(store, cart, txn_id, buyer, phone, address)
+    path = save_invoice(invoice_text)
+    print("\n" + invoice_text)
+    print(f"\n📄 Invoice saved to: {path}")
+    cart.clear()
+
+def main():
+    store = Store(STORE_NAME, CATALOG)
+    cart = Cart()
+
+    print(f"Welcome to {STORE_NAME}!")
+    print("Type the number of an option to proceed.")
+    while True:
+        show_menu()
+        choice = input("Choose: ").strip()
+        if choice == "1":
+            view_categories(store)
+        elif choice == "2":
+            view_by_category(store)
+        elif choice == "3":
+            search_items(store)
+        elif choice == "4":
+            show_cart(cart)
+        elif choice == "5":
+            add_to_cart(store, cart)
+        elif choice == "6":
+            remove_from_cart(cart)
+        elif choice == "7":
+            apply_coupon(cart)
+        elif choice == "8":
+            checkout(store, cart)
+        elif choice == "9":
+            cart.clear()
+            print("Cart cleared.")
+        elif choice == "0":
+            print("Goodbye! 👋")
+            break
+        else:
+            print("Invalid choice.")
+
+if __name__ == "__main__":
+    main()
